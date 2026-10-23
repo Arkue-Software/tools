@@ -1,0 +1,345 @@
+# RedVital — api-gateway · rutas (APISIX standalone)
+# ------------------------------------------------------------------
+# T-305.1  Rutas /v1/* (el navegador llama /api/v1/*; se quita "/api")
+#          y exclusión explícita de /internal/.
+# T-305.2  Validación de firma, emisor y vigencia del token contra el JWKS
+#          de identity-service (plugin_configs: con-sesion).
+# T-305.3  Compuerta por ruta y rol (redvital-autorizacion: lectura/escritura).
+# T-305.4  Las denegaciones del gateway se entregan a la auditoría de Identidad.
+# T-305.5  X-Correlacion-Id generado o propagado en TODA petición (global_rules).
+#
+# Los roles de cada ruta salen de la matriz normativa del DD V3.0 (sección
+# 15.5). Cada servicio vuelve a validar el token y filtra por jurisdicción.
+#
+# Topología (3 VMs por ambiente): APISIX corre en la VM de borde junto a Caddy;
+# los servicios corren en la VM de servicios. Los nombres identity-service,
+# campaign-service y donation-service se resuelven a la IP de esa VM
+# (extra_hosts del compose de borde), con los puertos que publica:
+# Identidad 8080, Campañas 8082, Donación 8083. Identidad conserva el 8080 para
+# que su documento de descubrimiento sea válido dentro y fuera de su VM.
+# ------------------------------------------------------------------
+
+upstreams:
+  - id: identity
+    type: roundrobin
+    nodes:
+      "identity-service:8080": 1
+    timeout: { connect: 3, send: 3, read: 3 }   # plazo de 3 s del incremento (2.5)
+  - id: campaign
+    type: roundrobin
+    nodes:
+      "campaign-service:8082": 1
+    timeout: { connect: 3, send: 3, read: 3 }
+  - id: donation
+    type: roundrobin
+    nodes:
+      "donation-service:8083": 1
+    timeout: { connect: 3, send: 5, read: 5 }
+
+global_rules:
+  - id: correlacion                              # T-305.5
+    plugins:
+      request-id:
+        header_name: X-Correlacion-Id
+        include_in_response: true
+        algorithm: uuid                          # si el cliente ya lo envía, se respeta
+      prometheus:
+        prefer_name: true
+
+plugin_configs:
+  - id: con-sesion                               # T-305.2
+    plugins:
+      openid-connect:
+        client_id: redvital                      # = "aud" del token
+        client_secret: no-aplica-solo-bearer     # campo obligatorio del plugin; no se usa con bearer_only
+        discovery: http://identity-service:8080/.well-known/openid-configuration
+        bearer_only: true                        # solo valida tokens, no hace flujos de login
+        use_jwks: true                           # firma contra /.well-known/jwks.json
+        token_signing_alg_values_expected: RS256
+        set_access_token_header: false
+        set_userinfo_header: false
+  # Límite de tasa anónimo de 60 peticiones por minuto y origen (DD, EC-06).
+  # El origen es X-Forwarded-For, que Caddy reescribe con la IP real del cliente.
+  - id: publica
+    plugins:
+      limit-count:
+        count: 60
+        time_window: 60
+        key_type: var
+        key: http_x_forwarded_for
+        policy: local
+        rejected_code: 429
+        rejected_msg: Demasiadas solicitudes. Espera un minuto antes de volver a intentarlo.
+        show_limit_quota_header: false
+  # Inicio de sesión: más estricto, para frenar la adivinación de credenciales.
+  - id: publica-sesion
+    plugins:
+      limit-count:
+        count: 10
+        time_window: 60
+        key_type: var
+        key: http_x_forwarded_for
+        policy: local
+        rejected_code: 429
+        rejected_msg: Demasiados intentos de inicio de sesión. Espera un minuto antes de volver a intentarlo.
+        show_limit_quota_header: false
+
+plugin_metadata:
+  - id: redvital-autorizacion                    # T-305.4: a dónde y con qué credencial se entregan las denegaciones
+    identidad_url: http://identity-service:8080
+    cliente: gateway
+    ruta_secreto: /run/secrets/gateway-secreto-cliente
+
+routes:
+  # ---------------- T-305.1: /internal/ nunca se enruta ----------------
+  - id: bloquear-internal
+    uris: ["/api/internal/*", "/internal/*"]
+    priority: 100
+    plugins:
+      fault-injection:
+        abort:
+          http_status: 404
+          body: '{"tipo":"no-encontrado","titulo":"No encontrado","estado":404,"detalle":"Ruta no disponible."}'
+
+  # ---------------- Identidad (DD 15.1) ----------------
+  - id: identidad-iniciar-sesion
+    uri: /api/v1/sesiones
+    methods: [POST]
+    upstream_id: identity
+    plugin_config_id: publica-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+
+  - id: identidad-renovar-sesion                 # pública, con la cookie de renovación
+    uri: /api/v1/sesiones/renovacion
+    methods: [POST]
+    upstream_id: identity
+    plugin_config_id: publica
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+
+  - id: identidad-cerrar-sesion                  # cualquier perfil con cuenta
+    uri: /api/v1/sesiones/actual
+    methods: [DELETE]
+    upstream_id: identity
+    plugin_config_id: con-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: cerrar-sesion
+        recurso_tipo: sesion
+        escritura: [donante, operador, admin_banco, coordinador, admin_nacional, auditor]
+
+  - id: identidad-usuario-actual                 # común a todo perfil con cuenta (15.5)
+    uri: /api/v1/usuarios/me
+    methods: [GET]
+    upstream_id: identity
+    plugin_config_id: con-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: usuario-actual
+        recurso_tipo: usuario
+        lectura: [donante, operador, admin_banco, coordinador, admin_nacional, auditor]
+
+  # ---------------- Campañas (DD 15.3) ----------------
+  - id: campanias-listado                        # pública con token opcional: el token, si viene, lo valida Campañas (EC-03)
+    uri: /api/v1/campanias
+    methods: [GET]
+    upstream_id: campaign
+    plugin_config_id: publica
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+
+  - id: campanias-detalle
+    uri: /api/v1/campanias/*
+    methods: [GET]
+    upstream_id: campaign
+    plugin_config_id: con-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: campanias
+        recurso_tipo: campania
+        lectura: [donante, operador, admin_banco, coordinador, admin_nacional]
+
+  - id: campanias-publicacion-y-cierre           # POST .../publicacion y .../cierre
+    uri: /api/v1/campanias/*
+    methods: [POST]
+    upstream_id: campaign
+    plugin_config_id: con-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: campanias
+        recurso_tipo: campania
+        escritura: [admin_banco]
+
+  # ---------------- Donación, M1 (DD 15.4, Tabla 34) ----------------
+  - id: donacion-intenciones-registro            # registro anónimo: público
+    uri: /api/v1/intenciones
+    methods: [POST]
+    upstream_id: donation
+    plugin_config_id: publica
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+
+  - id: donacion-intenciones-consulta            # público; con token de operador, Donación muestra más
+    uri: /api/v1/intenciones/*
+    methods: [GET]
+    upstream_id: donation
+    plugin_config_id: publica
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+
+  - id: donacion-donantes-registro               # crear cuenta de donante: público
+    uri: /api/v1/donantes
+    methods: [POST]
+    upstream_id: donation
+    plugin_config_id: publica
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+
+  - id: donacion-donantes-propio                 # perfil, elegibilidad, historial, reconocimientos, consentimientos
+    uris: ["/api/v1/donantes/me", "/api/v1/donantes/me/*"]
+    methods: [GET, PUT, POST]
+    upstream_id: donation
+    plugin_config_id: con-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: donante-propio
+        recurso_tipo: donante
+        lectura: [donante]
+        escritura: [donante]
+
+  - id: donacion-donantes-busqueda               # el operador identifica al donante presente
+    uri: /api/v1/donantes/busqueda
+    methods: [POST]
+    upstream_id: donation
+    plugin_config_id: con-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: busqueda-donante
+        recurso_tipo: donante
+        escritura: [operador]
+
+  # ---------------- Donación, M3 (DD 15.4, Tabla 35) ----------------
+  - id: donacion-donaciones-escritura            # registrar y fraccionar
+    uris: ["/api/v1/donaciones", "/api/v1/donaciones/*"]
+    methods: [POST]
+    upstream_id: donation
+    plugin_config_id: con-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: donaciones
+        recurso_tipo: donacion
+        escritura: [operador]
+
+  - id: donacion-donaciones-lectura
+    uri: /api/v1/donaciones/*
+    methods: [GET]
+    upstream_id: donation
+    plugin_config_id: con-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: donaciones
+        recurso_tipo: donacion
+        lectura: [operador, admin_banco, coordinador, admin_nacional]
+
+  - id: donacion-unidades-lectura
+    uris: ["/api/v1/unidades", "/api/v1/unidades/*"]
+    methods: [GET]
+    upstream_id: donation
+    plugin_config_id: con-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: unidades
+        recurso_tipo: unidad
+        lectura: [operador, admin_banco, coordinador, admin_nacional, auditor]
+
+  - id: donacion-unidades-escritura              # transiciones del ciclo de vida
+    uri: /api/v1/unidades/*
+    methods: [POST, DELETE]
+    upstream_id: donation
+    plugin_config_id: con-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: unidades
+        recurso_tipo: unidad
+        escritura: [operador]
+
+  # ---------------- Donación, M4 (DD 15.4, Tabla 36) ----------------
+  - id: donacion-inventario-lectura
+    uris: ["/api/v1/inventario", "/api/v1/inventario/*"]
+    methods: [GET]
+    upstream_id: donation
+    plugin_config_id: con-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: inventario-y-umbrales
+        recurso_tipo: inventario
+        lectura: [operador, admin_banco, coordinador, admin_nacional]
+
+  - id: donacion-umbrales-escritura
+    uri: /api/v1/inventario/umbrales
+    methods: [PUT]
+    upstream_id: donation
+    plugin_config_id: con-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: inventario-y-umbrales
+        recurso_tipo: umbral_inventario
+        escritura: [admin_banco]
+
+  - id: donacion-alertas-lectura
+    uri: /api/v1/alertas
+    methods: [GET]
+    upstream_id: donation
+    plugin_config_id: con-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: alertas
+        recurso_tipo: alerta
+        lectura: [operador, admin_banco, coordinador]
+
+  - id: donacion-alertas-atencion
+    uri: /api/v1/alertas/*
+    methods: [POST]
+    upstream_id: donation
+    plugin_config_id: con-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: alertas
+        recurso_tipo: alerta
+        escritura: [admin_banco]
+#END
