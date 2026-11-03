@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # RedVital · api-gateway · Corre en tu máquina lo mismo que el CI (ci-apisix.yml):
 #   1. yamllint de config/ y marcador #END del modo standalone;
-#   2. servicios simulados (Identidad, Campañas, Donación) en una red aislada;
+#   2. servicios simulados (Identidad, Campañas, Donación, Institucional) en una red aislada;
 #   3. APISIX 3.19 con la configuración y el plugin del repo, sin errores al arrancar;
 #   4. t-305.4: un 401 de APISIX llega a la auditoría de Identidad.
 # Al terminar, bien o mal, borra los contenedores y la red.
@@ -14,7 +14,7 @@ cd "$(dirname "$0")/.."
 RAIZ=$PWD
 RED=apisix-prueba-local
 SECRETO=$(mktemp)
-CONTENEDORES="apisix-prueba-local identidad-prueba-local campanas-prueba-local donacion-prueba-local"
+CONTENEDORES="apisix-prueba-local identidad-prueba-local campanas-prueba-local donacion-prueba-local institucional-prueba-local"
 
 limpiar() {
   docker rm -f $CONTENEDORES >/dev/null 2>&1 || true
@@ -48,6 +48,8 @@ docker run -d --name campanas-prueba-local --network "$RED" --network-alias camp
   python:3.12-alpine python -m http.server 8082 --bind 0.0.0.0 >/dev/null
 docker run -d --name donacion-prueba-local --network "$RED" --network-alias donation-service \
   python:3.12-alpine python -m http.server 8083 --bind 0.0.0.0 >/dev/null
+docker run -d --name institucional-prueba-local --network "$RED" --network-alias institutional-service \
+  python:3.12-alpine python -m http.server 8084 --bind 0.0.0.0 >/dev/null
 
 echo "3/4 APISIX con la configuración del repo"
 docker run -d --name apisix-prueba-local --network "$RED" \

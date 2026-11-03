@@ -15,7 +15,7 @@
 # los servicios corren en la VM de servicios. Los nombres identity-service,
 # campaign-service y donation-service se resuelven a la IP de esa VM
 # (extra_hosts del compose de borde), con los puertos que publica:
-# Identidad 8080, Campañas 8082, Donación 8083. Identidad conserva el 8080 para
+# Identidad 8080, Campañas 8082, Donación 8083, Institucional 8084. Identidad conserva el 8080 para
 # que su documento de descubrimiento sea válido dentro y fuera de su VM.
 # ------------------------------------------------------------------
 
@@ -35,6 +35,13 @@ upstreams:
     nodes:
       "donation-service:8083": 1
     timeout: { connect: 3, send: 5, read: 5 }
+  # Institucional compone indicadores y bitácora con otros servicios (3 s cada
+  # uno, en paralelo): se le da algo más que el plazo de una llamada.
+  - id: institutional
+    type: roundrobin
+    nodes:
+      "institutional-service:8084": 1
+    timeout: { connect: 3, send: 5, read: 6 }
 
 global_rules:
   - id: correlacion                              # T-305.5
@@ -83,6 +90,18 @@ plugin_configs:
         rejected_code: 429
         rejected_msg: Demasiados intentos de inicio de sesión. Espera un minuto antes de volver a intentarlo.
         show_limit_quota_header: false
+  # Alta de cuentas de donante: igual de estricto, para frenar las altas masivas.
+  - id: publica-registro
+    plugins:
+      limit-count:
+        count: 10
+        time_window: 60
+        key_type: var
+        key: http_x_forwarded_for
+        policy: local
+        rejected_code: 429
+        rejected_msg: Demasiadas cuentas creadas desde este origen. Espera un minuto antes de volver a intentarlo.
+        show_limit_quota_header: false
 
 plugin_metadata:
   - id: redvital-autorizacion                    # T-305.4: a dónde y con qué credencial se entregan las denegaciones
@@ -107,6 +126,15 @@ routes:
     methods: [POST]
     upstream_id: identity
     plugin_config_id: publica-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+
+  - id: identidad-cuentas-donante                # RF-01: la persona crea su cuenta, sin sesión
+    uri: /api/v1/cuentas-donante
+    methods: [POST]
+    upstream_id: identity
+    plugin_config_id: publica-registro
     plugins:
       proxy-rewrite:
         regex_uri: ["^/api/(.*)", "/$1"]
@@ -182,6 +210,117 @@ routes:
         recurso_tipo: campania
         escritura: [admin_banco]
 
+  - id: campanias-creacion                       # crear en borrador (DD 15.3)
+    uri: /api/v1/campanias
+    methods: [POST]
+    upstream_id: campaign
+    plugin_config_id: con-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: campanias
+        recurso_tipo: campania
+        escritura: [admin_banco]
+
+  - id: campanias-edicion                        # editar en borrador
+    uri: /api/v1/campanias/*
+    methods: [PUT]
+    upstream_id: campaign
+    plugin_config_id: con-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: campanias
+        recurso_tipo: campania
+        escritura: [admin_banco]
+
+  # ---------------- Institucional (DD 15.2, Tabla 32) ----------------
+  # Grupo 10: U4 L, U5 E, U6 E, U7 L; el alta de territorio es solo de U6.
+  - id: institucional-territorios
+    uri: /api/v1/territorios
+    methods: [GET, POST]
+    upstream_id: institutional
+    plugin_config_id: con-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: territorios-instituciones
+        recurso_tipo: territorio
+        lectura: [admin_banco, coordinador, auditor]
+        escritura: [admin_nacional]
+
+  - id: institucional-instituciones
+    uri: /api/v1/instituciones
+    methods: [GET, POST]
+    upstream_id: institutional
+    plugin_config_id: con-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: territorios-instituciones
+        recurso_tipo: institucion
+        lectura: [admin_banco, auditor]
+        escritura: [coordinador, admin_nacional]
+
+  # Resolver una institución: común a todo perfil con cuenta, fuera de la matriz (15.5).
+  - id: institucional-institucion-lectura
+    uri: /api/v1/instituciones/*
+    methods: [GET]
+    upstream_id: institutional
+    plugin_config_id: con-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: institucion
+        recurso_tipo: institucion
+        lectura: [donante, operador, admin_banco, coordinador, admin_nacional, auditor]
+
+  - id: institucional-institucion-cambio
+    uri: /api/v1/instituciones/*
+    methods: [PUT]
+    upstream_id: institutional
+    plugin_config_id: con-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: territorios-instituciones
+        recurso_tipo: institucion
+        escritura: [coordinador, admin_nacional]
+
+  # Grupo 12: U4, U5 y U6 en lectura (RI-03: M7 no escribe).
+  - id: institucional-indicadores
+    uri: /api/v1/indicadores
+    methods: [GET]
+    upstream_id: institutional
+    plugin_config_id: con-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: indicadores
+        recurso_tipo: indicador
+        lectura: [admin_banco, coordinador, admin_nacional]
+
+  # Grupo 13: solo U7, sin ninguna escritura (RI-04).
+  - id: institucional-bitacora
+    uri: /api/v1/auditoria
+    methods: [GET]
+    upstream_id: institutional
+    plugin_config_id: con-sesion
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: bitacora
+        recurso_tipo: bitacora
+        lectura: [auditor]
+
   # ---------------- Donación, M1 (DD 15.4, Tabla 34) ----------------
   - id: donacion-intenciones-registro            # registro anónimo: público
     uri: /api/v1/intenciones
@@ -201,14 +340,18 @@ routes:
       proxy-rewrite:
         regex_uri: ["^/api/(.*)", "/$1"]
 
-  - id: donacion-donantes-registro               # crear cuenta de donante: público
+  - id: donacion-donantes-registro               # perfil de donante: con la sesión de la cuenta recién creada
     uri: /api/v1/donantes
     methods: [POST]
     upstream_id: donation
-    plugin_config_id: publica
+    plugin_config_id: con-sesion
     plugins:
       proxy-rewrite:
         regex_uri: ["^/api/(.*)", "/$1"]
+      redvital-autorizacion:
+        grupo: donante-registro
+        recurso_tipo: donante
+        escritura: [donante]
 
   - id: donacion-donantes-propio                 # perfil, elegibilidad, historial, reconocimientos, consentimientos
     uris: ["/api/v1/donantes/me", "/api/v1/donantes/me/*"]
