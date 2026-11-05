@@ -1,0 +1,34 @@
+# RedVital — api-gateway (Apache APISIX, modo DB-less / standalone)
+# Sin etcd ni panel administrativo: la configuración vive en apisix.yaml,
+# versionada en este repositorio (ADR del API Gateway, decisión APISIX).
+
+deployment:
+  role: data_plane
+  role_data_plane:
+    config_provider: yaml
+
+apisix:
+  node_listen: 9080
+  enable_admin: false
+  # Carga del plugin propio: plugins/apisix/plugins/redvital-autorizacion.lua
+  extra_lua_path: "/usr/local/apisix/custom/?.lua"
+
+nginx_config:
+  error_log_level: warn
+
+# Lista explícita: solo se cargan los plugins que se usan.
+plugins:
+  - request-id             # T-305.5
+  - proxy-rewrite          # T-305.1 (quita /api)
+  - openid-connect         # T-305.2 (firma y vigencia contra el JWKS)
+  - fault-injection        # T-305.1 (bloqueo explícito de /internal/)
+  - redvital-autorizacion  # T-305.3 y T-305.4
+  - limit-count            # límite de tasa anónimo (EC-06)
+  - prometheus             # métricas para la VM de Tools
+
+plugin_attr:
+  prometheus:
+    # Solo la VM de Tools alcanza este puerto (firewall de la VM de borde).
+    export_addr:
+      ip: 0.0.0.0
+      port: 9091
