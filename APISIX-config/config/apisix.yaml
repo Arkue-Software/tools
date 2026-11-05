@@ -35,8 +35,8 @@ upstreams:
     nodes:
       "donation-service:8083": 1
     timeout: { connect: 3, send: 5, read: 5 }
-  # Institucional compone indicadores y bitácora con otros servicios (3 s cada
-  # uno, en paralelo): se le da algo más que el plazo de una llamada.
+  # Institucional lee indicadores y bitácora de sus copias locales (EV-09 y
+  # EV-10): se le da algo más de plazo porque esas consultas recorren varias series.
   - id: institutional
     type: roundrobin
     nodes:
