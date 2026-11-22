@@ -1,0 +1,29 @@
+# RedVital — api-gateway. Fragmento para levantar APISIX en local.
+# La composición completa del sistema es de DevOps (RedVital/docker-compose.yml):
+# este bloque se integra allí, en las redes red_borde y red_aplicacion.
+services:
+  api-gateway:
+    image: apache/apisix:3.19.0-debian
+    volumes:
+      - ./config/config.yaml:/usr/local/apisix/conf/config.yaml:ro
+      - ./config/apisix.yaml:/usr/local/apisix/conf/apisix.yaml:ro
+      - ./plugins:/usr/local/apisix/custom:ro
+    secrets:
+      - gateway-secreto-cliente
+    ports:
+      - "${APISIX_PORT:-9080}:9080"
+    networks:
+      - red_borde
+      - red_aplicacion
+
+networks:
+  red_borde:
+    external: true
+    name: "${RED_BORDE_NETWORK:-red_borde}"
+  red_aplicacion:
+    external: true
+    name: "${RED_APLICACION_NETWORK:-red_aplicacion}"
+
+secrets:
+  gateway-secreto-cliente:
+    file: ./secretos/gateway-secreto-cliente

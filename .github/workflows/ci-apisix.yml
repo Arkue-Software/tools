@@ -1,0 +1,21 @@
+name: CI - API Gateway
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: ["main", "develop"]
+
+jobs:
+  gateway:
+    name: Validar la configuración de APISIX
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el codigo
+        uses: actions/checkout@v4
+
+      # Lo mismo que se corre en local: yamllint, servicios simulados, arranque
+      # de APISIX con la configuración y el plugin del repositorio, y la entrega
+      # de un 401 a la auditoría de Identidad (T-305.4).
+      - name: Ejecutar las pruebas del gateway
+        working-directory: APISIX-config
+        run: bash pruebas/correr-local.sh
